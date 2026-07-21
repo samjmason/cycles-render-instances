@@ -129,8 +129,6 @@ scripts; each runs as `blender -b -P <script>`.
 
 ## Notes on testing, in case they save someone else time
 
-Two mistakes cost me hours and both are easy to repeat.
-
 **A pixel-identical render can mean nothing.** While the patch was building
 every instance twice, renders were bit-exact — two complete, perfectly
 overlapping copies of a scatter match. Mean and max difference of `0.000000`
