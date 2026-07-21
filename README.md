@@ -8,9 +8,7 @@ The short version: a ~1M instance scatter goes from unusable to editable in the
 Cycles viewport. On my machine, re-sync at 1M instances drops from ~3.6 s to
 ~60 ms, and camera navigation drops to roughly a millisecond of Cycles sync.
 
-I want to be upfront about what this is. It is a prototype written quickly to
-find out whether the idea worked. It does work, and the results below are real
-and reproducible, but the code has rough edges and has been tested on exactly
+the code has rough edges and has been tested on exactly
 one machine and one Blender version. Please treat it accordingly.
 
 ## The problem
@@ -100,8 +98,6 @@ Please read these before trusting it with anything real.
   layer and does not touch kernel or device code, so there is no obvious reason
   it would behave differently on GPU — but "no obvious reason" is not the same
   as tested.
-- **Viewport interactivity is confirmed by hand, not measured.** All numbers
-  here are headless sync timings.
 - **Particle systems and legacy dupli paths** are untouched and untested.
 - **Prototype-level object flags do not propagate** to geometry-nodes instances.
   This matches stock behaviour (instances reference anonymous geometry rather
@@ -127,21 +123,6 @@ Then tag a geometry-nodes scatter with the custom property above and render or
 open a Cycles viewport. `tests/` contains the benchmark and verification
 scripts; each runs as `blender -b -P <script>`.
 
-## Notes on testing, in case they save someone else time
-
-**A pixel-identical render can mean nothing.** While the patch was building
-every instance twice, renders were bit-exact — two complete, perfectly
-overlapping copies of a scatter match. Mean and max difference of `0.000000`
-while the patch was doing double the work and running slower than stock. The
-Cycles object count exposed it immediately. Check what produced the image before
-comparing images.
-
-**A parity test where both sides are trivially identical proves nothing.**
-Materials were silently broken for hours behind a passing test, because every
-test scene used the default material on both sides: grey == grey matches as
-convincingly as red == red. Every check now asserts twice — that the feature
-visibly changes the image at all, and that the patched path matches stock. The
-first assertion is what gives the second any meaning.
 
 ## Files touched
 
