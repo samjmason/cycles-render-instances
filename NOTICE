@@ -1,0 +1,10 @@
+This repository contains a patch to Blender (https://www.blender.org), which is
+licensed under the GNU General Public License version 2 or later.
+
+As a derivative work, this patch and the accompanying scripts are licensed under
+the same terms:
+
+    SPDX-License-Identifier: GPL-2.0-or-later
+
+See LICENSE for the full text of GPL-2.0. "or later" applies, matching Blender's
+own licensing.
