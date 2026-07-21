@@ -1,0 +1,3 @@
+# Patches must keep LF endings or `git apply` fails on checkout.
+*.patch -text
+*.diff -text

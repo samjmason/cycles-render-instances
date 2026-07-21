@@ -1,0 +1,652 @@
+diff --git a/intern/cycles/blender/object.cpp b/intern/cycles/blender/object.cpp
+index 319aa849515..d16d9b1bbcf 100644
+--- a/intern/cycles/blender/object.cpp
++++ b/intern/cycles/blender/object.cpp
+@@ -21,8 +21,14 @@
+ #include "util/hash.h"
+ #include "util/log.h"
+ #include "util/task.h"
++#include "util/time.h"
+ 
++#include "BKE_attribute.hh"
++#include "BKE_collection.hh"
+ #include "BKE_duplilist.hh"
++#include "BKE_geometry_set.hh"
++#include "BKE_idprop.hh"
++#include "BKE_instances.hh"
+ #include "BKE_layer.hh"
+ #include "BKE_material.hh"
+ #include "BKE_object.hh"
+@@ -458,6 +464,459 @@ bool BlenderSync::sync_object_attributes(blender::Object &b_ob,
+   return changed;
+ }
+ 
++/* Render Instances
++ *
++ * For a point cloud tagged with the "cycles_render_instancer" custom property,
++ * read its evaluated points directly and create one Cycles object per point,
++ * all sharing a single prototype geometry. This bypasses object_duplilist(),
++ * which the depsgraph iterator otherwise re-runs in full on every sync.
++ *
++ * M0: position and uniform scale only. No orient, collections, materials or
++ * motion blur yet. */
++
++bool BlenderSync::object_is_render_instancer(blender::Object &b_ob)
++{
++  if (b_ob.id.properties == nullptr) {
++    return false;
++  }
++  const blender::IDProperty *prop = blender::IDP_GetPropertyFromGroup(
++      b_ob.id.properties, "cycles_render_instancer");
++  if (prop == nullptr) {
++    return false;
++  }
++  /* Python bools arrive as IDP_BOOLEAN, but older files may carry IDP_INT.
++   * Both store the value in data.val (see IDP_bool_get / IDP_int_get). */
++  if (prop->type != blender::IDP_BOOLEAN && prop->type != blender::IDP_INT) {
++    return false;
++  }
++  if (prop->data.val == 0) {
++    return false;
++  }
++  /* Only meaningful when geometry nodes actually produced unrealized
++   * instances for us to read. */
++  const blender::bke::GeometrySet *b_geometry_set = b_ob.runtime->geometry_set_eval;
++  return b_geometry_set != nullptr && b_geometry_set->has_instances();
++}
++
++/* Flatten one instance reference into the geometry it actually draws, with
++ * each piece's transform relative to the instance. Mirrors what
++ * object_duplilist() would have produced:
++ *   - Object      -> the object's own geometry
++ *   - GeometrySet -> its mesh, and/or nested instances (recursed)
++ *   - Collection  -> every visible member, offset by instance_offset
++ *                    (see make_duplis_collection in object_dupli.cc)
++ */
++void BlenderSync::render_instances_collect_prototypes(
++    const blender::bke::InstanceReference &b_reference,
++    const Transform &local,
++    blender::Object &b_instancer,
++    vector<RenderInstanceProto> &r_protos,
++    const int depth)
++{
++  /* Same recursion bound Blender uses for duplis. */
++  if (depth >= 8) {
++    LOG_INFO << "render-instances: recursion limit reached, nested instances truncated";
++    return;
++  }
++
++  switch (b_reference.type()) {
++    case blender::bke::InstanceReference::Type::Object: {
++      blender::Object *b_proto = &b_reference.object();
++      const bool adaptive = object_subdivision_type(*b_proto, preview, use_adaptive_subdivision) !=
++                            Mesh::SUBDIVISION_NONE;
++      BObjectInfo b_proto_info{b_proto, b_proto, object_get_data(*b_proto, adaptive), adaptive};
++      if (!object_is_geometry(b_proto_info)) {
++        return;
++      }
++      Geometry *geometry = sync_geometry(b_proto_info, false, false, nullptr);
++      if (geometry) {
++        r_protos.push_back({geometry,
++                            local,
++                            object_ray_visibility(*b_proto),
++                            (b_proto->visibility_flag & blender::OB_SHADOW_CATCHER) != 0});
++      }
++      return;
++    }
++
++    case blender::bke::InstanceReference::Type::GeometrySet: {
++      const blender::bke::GeometrySet &b_set = b_reference.geometry_set();
++
++      const blender::Mesh *b_mesh = b_set.get_mesh();
++      if (b_mesh != nullptr) {
++        blender::ID *b_mesh_id = const_cast<blender::ID *>(&b_mesh->id);
++        BObjectInfo b_proto_info{&b_instancer, &b_instancer, b_mesh_id, false};
++        Geometry *geometry = sync_geometry(b_proto_info, false, false, nullptr);
++        if (geometry) {
++          /* sync_geometry resolves materials from the *object's* slots
++           * (find_used_shaders, geometry.cpp:112). The instancer has none, so
++           * anonymous geometry would silently render with the default shader.
++           * Its materials live on the mesh itself, so resolve them from there.
++           * Slot order matches, so the per-face shader indices stay valid. */
++          array<Node *> mesh_shaders;
++          blender::Material *material_override = view_layer.material_override;
++          for (int m = 0; m < b_mesh->totcol; m++) {
++            if (material_override) {
++              find_shader(&material_override->id, mesh_shaders, scene->default_surface);
++            }
++            else {
++              find_shader(reinterpret_cast<blender::ID *>(b_mesh->mat[m]),
++                          mesh_shaders,
++                          scene->default_surface);
++            }
++          }
++          if (!mesh_shaders.empty()) {
++            geometry->set_used_shaders(mesh_shaders);
++          }
++
++          /* Anonymous geometry owns no object, so it carries no flags of its
++           * own; everything comes from the instancer. */
++          r_protos.push_back({geometry, local, PathRayVisibility(PATH_RAY_VISIBILITY_ALL), false});
++        }
++      }
++
++      /* Nested instances, e.g. Object Info with "As Instance" feeding
++       * Instance on Points. */
++      const blender::bke::Instances *b_nested = b_set.get_instances();
++      if (b_nested != nullptr) {
++        const blender::Span<blender::float4x4> b_nested_tfms = b_nested->transforms();
++        const blender::Span<int> b_nested_handles = b_nested->reference_handles();
++        const blender::Span<blender::bke::InstanceReference> b_nested_refs =
++            b_nested->references();
++        for (const int i : blender::IndexRange(b_nested_tfms.size())) {
++          render_instances_collect_prototypes(b_nested_refs[b_nested_handles[i]],
++                                              local * get_transform(b_nested_tfms[i]),
++                                              b_instancer,
++                                              r_protos,
++                                              depth + 1);
++        }
++      }
++      return;
++    }
++
++    case blender::bke::InstanceReference::Type::Collection: {
++      blender::Collection &b_collection = b_reference.collection();
++
++      /* The collection offset applies before member transforms. */
++      const Transform collection_local =
++          local * transform_translate(-make_float3(b_collection.instance_offset[0],
++                                                   b_collection.instance_offset[1],
++                                                   b_collection.instance_offset[2]));
++
++      const int base_flag = preview ? blender::BASE_ENABLED_VIEWPORT : blender::BASE_ENABLED_RENDER;
++      const int hide_flag = preview ? blender::OB_HIDE_VIEWPORT : blender::OB_HIDE_RENDER;
++
++      /* Cache list is already flattened over nested collections. */
++      for (blender::Base *b_base = static_cast<blender::Base *>(
++               blender::BKE_collection_object_cache_get(&b_collection).first);
++           b_base;
++           b_base = b_base->next)
++      {
++        blender::Object *b_member = b_base->object;
++        if (b_member == nullptr || b_member == &b_instancer) {
++          continue;
++        }
++        if ((b_base->flag & base_flag) == 0 || (b_member->visibility_flag & hide_flag) != 0) {
++          continue;
++        }
++        const bool adaptive = object_subdivision_type(
++                                  *b_member, preview, use_adaptive_subdivision) !=
++                              Mesh::SUBDIVISION_NONE;
++        BObjectInfo b_member_info{
++            b_member, b_member, object_get_data(*b_member, adaptive), adaptive};
++        if (!object_is_geometry(b_member_info)) {
++          continue;
++        }
++        Geometry *geometry = sync_geometry(b_member_info, false, false, nullptr);
++        if (geometry) {
++          r_protos.push_back({geometry,
++                              collection_local * get_transform(b_member->object_to_world()),
++                              object_ray_visibility(*b_member),
++                              (b_member->visibility_flag & blender::OB_SHADOW_CATCHER) != 0});
++        }
++      }
++      return;
++    }
++
++    case blender::bke::InstanceReference::Type::None:
++    default:
++      return;
++  }
++}
++
++void BlenderSync::render_instances_pre_sync()
++{
++  for (auto &entry : render_instance_sets) {
++    entry.second.used = false;
++  }
++}
++
++void BlenderSync::render_instances_post_sync()
++{
++  /* These objects are deliberately not in object_map, so id_map's sweep never
++   * sees them. Free the sets whose instancer is gone or no longer tagged. */
++  set<Object *> to_delete;
++  for (auto it = render_instance_sets.begin(); it != render_instance_sets.end();) {
++    if (it->second.used) {
++      ++it;
++      continue;
++    }
++    for (Object *object : it->second.objects) {
++      to_delete.insert(object);
++    }
++    it = render_instance_sets.erase(it);
++  }
++  if (!to_delete.empty()) {
++    scene->delete_nodes(to_delete);
++  }
++
++  render_instances_recalc.clear();
++}
++
++void BlenderSync::sync_render_instances(blender::Depsgraph &b_depsgraph,
++                                        blender::ViewLayer &b_view_layer,
++                                        blender::Object &b_ob,
++                                        const float motion_time)
++{
++  (void)b_depsgraph;
++
++  /* Read the instances geometry nodes already built, in their unrealized form.
++   * This is the same data object_duplilist() would expand into a DupliObject
++   * list; we consume it directly and skip that expansion. */
++  const blender::bke::GeometrySet *b_geometry_set = b_ob.runtime->geometry_set_eval;
++  if (b_geometry_set == nullptr) {
++    return;
++  }
++  const blender::bke::Instances *b_instances = b_geometry_set->get_instances();
++  if (b_instances == nullptr) {
++    return;
++  }
++
++  const blender::Span<blender::float4x4> b_transforms = b_instances->transforms();
++  const blender::Span<int> b_handles = b_instances->reference_handles();
++  const blender::Span<blender::bke::InstanceReference> b_references = b_instances->references();
++  const int num_instances = b_transforms.size();
++  if (num_instances == 0) {
++    return;
++  }
++
++  /* Flatten each distinct reference once into the geometry it draws. A
++   * reference may expand to several pieces (collection members, nested
++   * instances), so instances index into a per-handle list. */
++  const int num_references = b_references.size();
++  vector<vector<RenderInstanceProto>> protos_by_handle(num_references);
++  int num_empty_refs = 0;
++
++  for (int h = 0; h < num_references; h++) {
++    render_instances_collect_prototypes(
++        b_references[h], transform_identity(), b_ob, protos_by_handle[h], 0);
++    if (protos_by_handle[h].empty()) {
++      num_empty_refs++;
++    }
++  }
++
++  /* Total objects needed: one per (instance, prototype piece). */
++  size_t num_objects_needed = 0;
++  for (int i = 0; i < num_instances; i++) {
++    num_objects_needed += protos_by_handle[b_handles[i]].size();
++  }
++  if (num_objects_needed == 0) {
++    LOG_INFO << "render-instances: no drawable geometry from " << num_references
++             << " references, nothing synced";
++    return;
++  }
++
++  /* Instancer-source Attribute nodes. Blender resolves these via
++   * BKE_object_dupli_find_rgba_attribute -> find_geonode_attribute_rgba
++   * (object_dupli.cc:1942), which reads the named attribute off the instances
++   * component at the instance index. We have that component directly, so read
++   * it the same way instead of needing a DupliObject.
++   *
++   * Only gathered when a shader actually asks for one, so scenes that do not
++   * use instancer attributes pay nothing. */
++  struct InstancerAttribute {
++    ustring name;
++    blender::VArray<blender::ColorGeometry4f> data;
++  };
++  vector<InstancerAttribute> instancer_attributes;
++  {
++    set<ustring> seen;
++    const blender::bke::AttributeAccessor b_inst_attributes = b_instances->attributes();
++    for (const vector<RenderInstanceProto> &protos : protos_by_handle) {
++      for (const RenderInstanceProto &proto : protos) {
++        if (proto.geometry == nullptr) {
++          continue;
++        }
++        AttributeRequestSet requests = proto.geometry->needed_attributes();
++        for (const AttributeRequest &req : requests.requests) {
++          const ustring name = req.name;
++          if (seen.find(name) != seen.end()) {
++            continue;
++          }
++          std::string real_name;
++          if (blender_attribute_name_split_type(name, &real_name) !=
++              blender::SHD_ATTRIBUTE_INSTANCER)
++          {
++            continue;
++          }
++          seen.insert(name);
++          blender::VArray<blender::ColorGeometry4f> data =
++              *b_inst_attributes.lookup<blender::ColorGeometry4f>(real_name,
++                                                                  blender::bke::AttrDomain::Instance);
++          if (data) {
++            instancer_attributes.push_back({name, std::move(data)});
++          }
++        }
++      }
++    }
++  }
++  if (!instancer_attributes.empty()) {
++    LOG_INFO << "render-instances: " << instancer_attributes.size()
++             << " instancer attribute(s) requested by shaders";
++  }
++
++  /* Instance transforms are relative to the instancer. */
++  const Transform instancer_tfm = get_transform(b_ob.object_to_world());
++
++  /* Per-instance flags, mirroring what sync_object() derives for a dupli.
++   * The instancer plays the role of the dupli parent. */
++  const blender::Base *base = BKE_view_layer_base_find(&b_view_layer, &b_ob);
++  const bool use_holdout = (base && (base->flag & blender::BASE_HOLDOUT) != 0) ||
++                           ((b_ob.visibility_flag & blender::OB_HOLDOUT) != 0);
++  const bool instancer_shadow_catcher = (b_ob.visibility_flag & blender::OB_SHADOW_CATCHER) != 0;
++  const PathRayVisibility instancer_visibility = object_ray_visibility(b_ob);
++  const bool use_indirect_only = !use_holdout && base &&
++                                 ((base->flag & blender::BASE_INDIRECT_ONLY) != 0);
++
++  blender::PointerRNA b_ob_rna_ptr = RNA_id_pointer_create(&b_ob.id);
++  blender::PointerRNA cobject = RNA_pointer_get(&b_ob_rna_ptr, "cycles");
++  const float ao_distance = get_float(cobject, "ao_distance");
++  const bool is_caustics_caster = get_boolean(cobject, "is_caustics_caster");
++  const bool is_caustics_receiver = get_boolean(cobject, "is_caustics_receiver");
++  const float shadow_terminator_shading_offset = b_ob.shadow_terminator_shading_offset;
++  const float shadow_terminator_geometry_offset = b_ob.shadow_terminator_geometry_offset;
++
++  /* Flat per-instancer storage, indexed by instance index. Objects persist
++   * across syncs here instead of in object_map, so steady-state re-sync is an
++   * array index rather than an ordered-map lookup. */
++  RenderInstanceSet &instance_set = render_instance_sets[&b_ob];
++  instance_set.used = true;
++
++  /* Motion pass: sync_objects() is re-run once per motion step. Rebuilding
++   * here would overwrite the center-time transforms with this step's, leaving
++   * the instances at the wrong place and recording no motion at all. Instead
++   * write this step into the existing objects' motion arrays. */
++  if (motion_time != 0.0f) {
++    const map<void *, RenderInstanceSet>::iterator it = render_instance_sets.find(&b_ob);
++    if (it == render_instance_sets.end() || it->second.objects.size() != num_objects_needed) {
++      return;
++    }
++    size_t motion_slot = 0;
++    for (int i = 0; i < num_instances; i++) {
++      const Transform instance_tfm = instancer_tfm * get_transform(b_transforms[i]);
++      for (const RenderInstanceProto &proto : protos_by_handle[b_handles[i]]) {
++        Object *object = it->second.objects[motion_slot++];
++        if (object->use_motion()) {
++          const int time_index = object->motion_step(motion_time);
++          if (time_index >= 0) {
++            object->set_motion_tfm(instance_tfm * proto.local, time_index);
++          }
++        }
++      }
++    }
++    return;
++  }
++
++  /* If the depsgraph did not touch this instancer, its instances are already
++   * correct from the previous sync and the whole per-instance loop can be
++   * skipped -- this is what stops editing one instancer from stalling every
++   * other one. Marking the set used above keeps the objects alive, and the
++   * prototypes were re-synced above so geometry_map will not free them.
++   *
++   * Only safe when the object count is unchanged; otherwise fall through and
++   * rebuild. */
++  if (!render_instances_recalc.contains(&b_ob) &&
++      instance_set.objects.size() == num_objects_needed && num_objects_needed > 0)
++  {
++    LOG_INFO << "render-instances: " << num_instances << " instances unchanged, loop skipped";
++    return;
++  }
++
++  /* Object count shrank: free the tail. */
++  if (instance_set.objects.size() > num_objects_needed) {
++    set<Object *> to_delete;
++    for (size_t i = num_objects_needed; i < instance_set.objects.size(); i++) {
++      to_delete.insert(instance_set.objects[i]);
++    }
++    scene->delete_nodes(to_delete);
++    instance_set.objects.resize(num_objects_needed);
++  }
++
++  const double t_start = time_dt();
++  double t_map = 0.0;
++  size_t slot = 0;
++
++  for (int i = 0; i < num_instances; i++) {
++    const Transform instance_tfm = instancer_tfm * get_transform(b_transforms[i]);
++
++    for (const RenderInstanceProto &proto : protos_by_handle[b_handles[i]]) {
++      const double t0 = time_dt();
++      if (slot >= instance_set.objects.size()) {
++        instance_set.objects.push_back(scene->create_node<Object>());
++      }
++      Object *object = instance_set.objects[slot];
++      t_map += time_dt() - t0;
++
++      object->set_geometry(proto.geometry);
++      object->set_tfm(instance_tfm * proto.local);
++
++      /* Visibility is the intersection of prototype and instancer, exactly as
++       * sync_object() ANDs a dupli with its parent. */
++      PathRayVisibility visibility = proto.visibility & instancer_visibility;
++      if (use_indirect_only) {
++        visibility &= ~PATH_RAY_VISIBILITY_CAMERA;
++      }
++      object->set_visibility(visibility);
++      object->set_use_holdout(use_holdout);
++      object->set_is_shadow_catcher(proto.is_shadow_catcher || instancer_shadow_catcher);
++      object->set_ao_distance(ao_distance);
++      object->set_is_caustics_caster(is_caustics_caster);
++      object->set_is_caustics_receiver(is_caustics_receiver);
++      object->set_shadow_terminator_shading_offset(shadow_terminator_shading_offset);
++      object->set_shadow_terminator_geometry_offset(shadow_terminator_geometry_offset);
++
++      /* No DupliObject to inherit from, so synthesize these. */
++      object->set_random_id(hash_uint2(i, 0));
++      object->set_dupli_generated(zero_float3());
++      object->set_dupli_uv(zero_float2());
++
++      /* Per-instance shader attributes. */
++      if (!instancer_attributes.empty()) {
++        object->attributes.clear();
++        for (const InstancerAttribute &attr : instancer_attributes) {
++          const blender::ColorGeometry4f c = attr.data[i];
++          const float4 value = make_float4(c.r, c.g, c.b, c.a);
++          object->attributes.push_back(ParamValue(attr.name, TypeFloat4, 1, &value));
++        }
++      }
++
++      /* Size the motion array now; motion passes fill it in later. */
++      if (scene->need_motion() != Scene::MOTION_NONE) {
++        sync_object_motion_init(b_ob, b_ob, object);
++      }
++
++      object->tag_update(scene);
++      slot++;
++    }
++  }
++
++  const double t_total = time_dt() - t_start;
++  LOG_INFO << "render-instances: " << num_instances << " instances -> " << slot
++           << " objects, " << num_references << " refs (" << num_empty_refs << " empty) in "
++           << t_total * 1000.0 << " ms (object_map " << t_map * 1000.0 << " ms, "
++           << (t_total > 0.0 ? 100.0 * t_map / t_total : 0.0) << "%; build "
++           << (t_total - t_map) * 1000.0 << " ms)";
++}
++
+ /* Object Loop */
+ 
+ void BlenderSync::sync_objects(blender::Depsgraph &b_depsgraph,
+@@ -475,6 +934,7 @@ void BlenderSync::sync_objects(blender::Depsgraph &b_depsgraph,
+     /* prepare for sync */
+     geometry_map.pre_sync();
+     object_map.pre_sync();
++    render_instances_pre_sync();
+     procedural_map.pre_sync();
+     particle_system_map.pre_sync();
+     motion_times.clear();
+@@ -522,6 +982,13 @@ void BlenderSync::sync_objects(blender::Depsgraph &b_depsgraph,
+       continue;
+     }
+ 
++    /* Render-instance source: build instances from the point data directly and
++     * skip the normal path, so it is not also synced as a plain point cloud. */
++    if (object_is_render_instancer(*b_ob)) {
++      sync_render_instances(b_depsgraph, b_view_layer, *b_ob, motion_time);
++      continue;
++    }
++
+     /* Load per-object culling data. */
+     culling.init_object(scene, *b_ob);
+ 
+@@ -566,6 +1033,9 @@ void BlenderSync::sync_objects(blender::Depsgraph &b_depsgraph,
+ 
+   geom_task_pool.wait_work();
+ 
++  LOG_INFO << "render-instances: scene has " << scene->objects.size()
++           << " cycles objects after sync";
++
+   progress.set_sync_status("");
+ 
+   if (!cancel && !motion) {
+@@ -575,6 +1045,7 @@ void BlenderSync::sync_objects(blender::Depsgraph &b_depsgraph,
+     /* Handle removed data and modified pointers, as this may free memory, delete Nodes in the
+      * right order to ensure that dependent data is freed after their users. Objects should be
+      * freed before particle systems and geometries. */
++    render_instances_post_sync();
+     object_map.post_sync();
+     geometry_map.post_sync();
+     particle_system_map.post_sync();
+diff --git a/intern/cycles/blender/sync.cpp b/intern/cycles/blender/sync.cpp
+index 4560ba9d37f..b091832b55e 100644
+--- a/intern/cycles/blender/sync.cpp
++++ b/intern/cycles/blender/sync.cpp
+@@ -155,6 +155,18 @@ void BlenderSync::sync_recalc(blender::Depsgraph &b_depsgraph,
+         object_map.set_recalc(b_ob);
+       }
+ 
++      /* Track render instancers separately: their instance objects live in
++       * flat per-instancer storage rather than object_map, so they need their
++       * own dirty signal to decide whether the per-instance loop can be
++       * skipped entirely. Without this, touching any object in the scene
++       * re-runs every instancer's loop. */
++      if ((b_id->recalc & (blender::ID_RECALC_GEOMETRY | blender::ID_RECALC_TRANSFORM |
++                           blender::ID_RECALC_SHADING)) != 0 ||
++          (b_ob->data && (b_ob->data->recalc & blender::ID_RECALC_ALL) != 0))
++      {
++        render_instances_recalc.insert(b_ob);
++      }
++
+       if (can_have_geometry || is_light) {
+         const bool updated_geometry = (b_id->recalc & blender::ID_RECALC_GEOMETRY) != 0 ||
+                                       (b_ob->data &&
+diff --git a/intern/cycles/blender/sync.h b/intern/cycles/blender/sync.h
+index 58a9269f1c4..4db27f08215 100644
+--- a/intern/cycles/blender/sync.h
++++ b/intern/cycles/blender/sync.h
+@@ -20,6 +20,9 @@
+ namespace blender {
+ struct DEGObjectIterData;
+ struct MeshSequenceCacheModifier;
++namespace bke {
++class InstanceReference;
++}
+ }  // namespace blender
+ 
+ CCL_NAMESPACE_BEGIN
+@@ -178,6 +181,50 @@ class BlenderSync {
+                               blender::DEGObjectIterData &b_deg_iter_data,
+                               Object *object);
+ 
++  /* Render instances: build instance objects directly from the instances
++   * geometry nodes already produced, bypassing object_duplilist.
++   * See object.cpp. */
++  bool object_is_render_instancer(blender::Object &b_ob);
++  void sync_render_instances(blender::Depsgraph &b_depsgraph,
++                             blender::ViewLayer &b_view_layer,
++                             blender::Object &b_ob,
++                             float motion_time);
++
++  /* Instance objects are held in a flat array per instancer rather than in
++   * object_map. object_map is an ordered map whose per-instance lookup cost
++   * dominates instance sync at scale (~80% of the loop at 490k), and indexing
++   * a vector by instance index is O(1). It also lets an unchanged instancer be
++   * kept alive in bulk instead of re-marking every object as used. */
++  struct RenderInstanceSet {
++    vector<Object *> objects;
++    bool used = false;
++  };
++
++  /* One reference can expand to several pieces of geometry: a collection
++   * reference yields one per member, and a geometry set may hold nested
++   * instances. Each entry carries the geometry plus its transform relative to
++   * the instance. */
++  struct RenderInstanceProto {
++    Geometry *geometry;
++    Transform local;
++    /* Ray visibility of the prototype itself; combined with the instancer's. */
++    PathRayVisibility visibility;
++    bool is_shadow_catcher;
++  };
++  void render_instances_collect_prototypes(const blender::bke::InstanceReference &b_reference,
++                                           const Transform &local,
++                                           blender::Object &b_instancer,
++                                           vector<RenderInstanceProto> &r_protos,
++                                           int depth);
++  map<void *, RenderInstanceSet> render_instance_sets;
++  /* Instancers whose transform/geometry/shading the depsgraph tagged this
++   * update. Populated in sync_recalc, consumed in sync_render_instances so an
++   * untouched instancer can skip its whole per-instance loop, and cleared in
++   * render_instances_post_sync. */
++  set<void *> render_instances_recalc;
++  void render_instances_pre_sync();
++  void render_instances_post_sync();
++
+   /* Volume */
+   void sync_volume(BObjectInfo &b_ob_info, Volume *volume);
+ 
+diff --git a/source/blender/depsgraph/intern/depsgraph_query_iter.cc b/source/blender/depsgraph/intern/depsgraph_query_iter.cc
+index 663aeb66851..a52f4af9b62 100644
+--- a/source/blender/depsgraph/intern/depsgraph_query_iter.cc
++++ b/source/blender/depsgraph/intern/depsgraph_query_iter.cc
+@@ -103,6 +103,30 @@ void deg_iterator_duplis_init(DEGObjectIterData *data, Object *object)
+   data->dupli_object_next_index = 0;
+ }
+ 
++/* Objects tagged as Cycles render-instance sources have their instances read
++ * directly by the render engine from the evaluated geometry set. Expanding
++ * them into a DupliObject list here would be pure duplicate work: the engine
++ * would receive every instance twice, and the expansion this whole path exists
++ * to avoid would still be paid.
++ *
++ * Note this deliberately lives in the iterator rather than in the engine --
++ * the engine cannot prevent the expansion, because the iterator drives it. */
++static bool deg_object_skips_dupli_expansion(const Object *object)
++{
++  const ID *id = &object->id;
++  if (id->properties == nullptr) {
++    return false;
++  }
++  const IDProperty *prop = IDP_GetPropertyFromGroup(id->properties, "cycles_render_instancer");
++  if (prop == nullptr) {
++    return false;
++  }
++  if (prop->type != IDP_BOOLEAN && prop->type != IDP_INT) {
++    return false;
++  }
++  return prop->data.val != 0;
++}
++
+ /* Returns false when iterator is exhausted. */
+ bool deg_iterator_duplis_step(DEGObjectIterData *data)
+ {
+@@ -247,7 +271,8 @@ bool deg_iterator_objects_step(DEGObjectIterData *data)
+ 
+     if (ob_visibility & OB_VISIBLE_INSTANCES) {
+       if ((data->flag & DEG_ITER_OBJECT_FLAG_DUPLI) &&
+-          ((object->transflag & OB_DUPLI) || object->runtime->geometry_set_eval != nullptr))
++          ((object->transflag & OB_DUPLI) || object->runtime->geometry_set_eval != nullptr) &&
++          !deg_object_skips_dupli_expansion(object))
+       {
+         BLI_assert(deg::deg_validate_eval_copy_datablock(&object->id));
+         object_duplilist(data->graph, object, data->settings->included_objects, data->dupli_list);
