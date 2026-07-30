@@ -1,5 +1,5 @@
 diff --git a/intern/cycles/blender/object.cpp b/intern/cycles/blender/object.cpp
-index 319aa849515..d16d9b1bbcf 100644
+index 319aa849515..ebb02c7c830 100644
 --- a/intern/cycles/blender/object.cpp
 +++ b/intern/cycles/blender/object.cpp
 @@ -21,8 +21,14 @@
@@ -485,21 +485,24 @@ index 319aa849515..d16d9b1bbcf 100644
      procedural_map.pre_sync();
      particle_system_map.pre_sync();
      motion_times.clear();
-@@ -522,6 +982,13 @@ void BlenderSync::sync_objects(blender::Depsgraph &b_depsgraph,
+@@ -522,6 +982,16 @@ void BlenderSync::sync_objects(blender::Depsgraph &b_depsgraph,
        continue;
      }
  
-+    /* Render-instance source: build instances from the point data directly and
-+     * skip the normal path, so it is not also synced as a plain point cloud. */
++    /* Render-instance source: build its instances directly from the evaluated
++     * geometry set, bypassing object_duplilist(). We do NOT continue here: the
++     * object may also carry realized geometry (e.g. Join Geometry of a ground
++     * mesh with the instances), which must still be synced by the normal path
++     * below. There is no double-up of the instances themselves, because the
++     * depsgraph iterator no longer expands duplis for this object. */
 +    if (object_is_render_instancer(*b_ob)) {
 +      sync_render_instances(b_depsgraph, b_view_layer, *b_ob, motion_time);
-+      continue;
 +    }
 +
      /* Load per-object culling data. */
      culling.init_object(scene, *b_ob);
  
-@@ -566,6 +1033,9 @@ void BlenderSync::sync_objects(blender::Depsgraph &b_depsgraph,
+@@ -566,6 +1036,9 @@ void BlenderSync::sync_objects(blender::Depsgraph &b_depsgraph,
  
    geom_task_pool.wait_work();
  
@@ -509,7 +512,7 @@ index 319aa849515..d16d9b1bbcf 100644
    progress.set_sync_status("");
  
    if (!cancel && !motion) {
-@@ -575,6 +1045,7 @@ void BlenderSync::sync_objects(blender::Depsgraph &b_depsgraph,
+@@ -575,6 +1048,7 @@ void BlenderSync::sync_objects(blender::Depsgraph &b_depsgraph,
      /* Handle removed data and modified pointers, as this may free memory, delete Nodes in the
       * right order to ensure that dependent data is freed after their users. Objects should be
       * freed before particle systems and geometries. */
