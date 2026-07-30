@@ -1,5 +1,4 @@
 # Cycles render instances
-VIBE CODED :(  :( :( :( :( :( :( :( :(
 
 An experimental patch for Blender 5.2 that lets Cycles read geometry-nodes
 instances directly instead of having them expanded through `object_duplilist()`.
