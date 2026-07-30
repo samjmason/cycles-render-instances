@@ -4,11 +4,14 @@ An experimental patch for Blender 5.2 that lets Cycles read geometry-nodes
 instances directly instead of having them expanded through `object_duplilist()`.
 
 The short version: a ~1M instance scatter goes from unusable to editable in the
-Cycles viewport. On my machine, re-sync at 1M instances drops from ~3.6 s to
-~60 ms, and camera navigation drops to roughly a millisecond of Cycles sync.
+Cycles viewport. Re-sync at 1M instances drops from ~3.6 s to ~60 ms, and camera
+navigation drops to roughly a millisecond of Cycles sync.
 
-the code has rough edges and has been tested on exactly
-one machine and one Blender version. Please treat it accordingly.
+This is a prototype. It works and the results below are real and reproducible,
+but it has been developed and tested on a single machine, and it uses a
+prototype activation mechanism (a custom property) rather than proper UI. Treat
+it accordingly. It is looking for review from someone who knows the Cycles and
+depsgraph code.
 
 ## The problem
 
@@ -43,12 +46,12 @@ Enable it per object with a custom property:
 scatter_object["cycles_render_instancer"] = True
 ```
 
-It appears in Object Properties → Custom Properties as a checkbox. No new node,
-no DNA/RNA change, and existing scatters do not need re-authoring.
+It appears in Object Properties → Custom Properties. No new node, no DNA/RNA
+change, and existing scatters do not need re-authoring.
 
 ## One thing worth knowing if you try something similar
 
-I started out assuming this could be confined to `BlenderSync`. It cannot.
+This cannot be confined to `BlenderSync`.
 
 The depsgraph iterator drives dupli expansion, so detecting the instancer inside
 Cycles' object loop and calling `continue` only skips Cycles' *handling* of
@@ -63,9 +66,9 @@ just `intern/cycles`.
 
 ## Results
 
-Blender 5.2, CPU-only build, Threadripper 3970X. Plain geometry-nodes
-`Instance on Points` scatter, tag off vs on, alternating within a single process,
-best-of-3 re-syncs.
+Blender 5.2, Threadripper 3970X. Plain geometry-nodes `Instance on Points`
+scatter, tag off vs on, alternating within a single process, best-of-3
+re-syncs.
 
 | instances | dupli path | this patch | |
 |---|---|---|---|
@@ -78,9 +81,22 @@ scatter still pays a full rebuild, around 660 ms at 1M. With two instancers in a
 scene, editing one no longer forces the other to rebuild (813 ms → skipped).
 
 Verified bit-identical to the dupli path (mean and max channel difference
-`0.000000`) for plain scatters, collection instancing, nested instances, motion
-blur, ray visibility, holdout, shadow catcher, materials, and instancer-source
-Attribute nodes.
+`0.000000`) for:
+
+- plain scatters
+- collection instancing
+- nested instances
+- per-instance non-uniform scale
+- motion blur
+- ray visibility, holdout, shadow catcher
+- materials
+- instancer-source Attribute nodes
+- objects that output both realized geometry and instances (e.g. Join Geometry
+  of a ground plane with a scatter)
+
+On GPU (RTX 4090 / OptiX), verified within the renderer's run-to-run noise
+floor. On GPU always measure that floor first — render the same scene twice —
+because OptiX is not bit-deterministic and "bit-identical" is a CPU-only bar.
 
 Absolute timings on this machine drift by ~3x with background load, so every A/B
 figure above is an alternating measurement inside one process. Numbers compared
@@ -92,20 +108,21 @@ Please read these before trusting it with anything real.
 
 - **Tested on one machine, one Blender version** (5.2, tag `v5.2.0`,
   `fbe6228777e7`). No CI, no cross-platform testing.
-- **CPU-only.** I never installed the CUDA toolkit, so the build has no GPU
-  kernels and GPU rendering is unverified. The patch is confined to the sync
-  layer and does not touch kernel or device code, so there is no obvious reason
-  it would behave differently on GPU — but "no obvious reason" is not the same
-  as tested.
+- **Viewport interactivity is confirmed by hand, not measured.** All numbers
+  above are headless sync timings.
+- **CUDA kernels are built for one GPU architecture** (`sm_89`, Ada / RTX 4000
+  series). OptiX kernels are portable across RTX cards; a CUDA-mode node on a
+  different architecture would fall back to CPU. Rebuild with more archs to
+  cover a mixed render farm.
 - **Particle systems and legacy dupli paths** are untouched and untested.
 - **Prototype-level object flags do not propagate** to geometry-nodes instances.
   This matches stock behaviour (instances reference anonymous geometry rather
   than the prototype object), but it can surprise you.
-- The marker is a custom property rather than proper RNA, which is fine for
-  experimenting and not what you would ship.
+- The marker is a custom property rather than proper RNA — fine for
+  experimenting, not what you would ship.
 
-If you hit something, I would genuinely like to know — particularly on GPU, or
-with scenes more complicated than the synthetic ones in `tests/`.
+If you hit something, I would like to know — particularly with scenes more
+complicated than the synthetic ones in `tests/`.
 
 ## Trying it
 
@@ -122,20 +139,37 @@ Then tag a geometry-nodes scatter with the custom property above and render or
 open a Cycles viewport. `tests/` contains the benchmark and verification
 scripts; each runs as `blender -b -P <script>`.
 
+## Notes on testing, in case they save someone else time
+
+Two mistakes cost real time here and both are easy to repeat.
+
+**A pixel-identical render can mean nothing.** While the patch was building
+every instance twice, renders were bit-exact — two complete, perfectly
+overlapping copies of a scatter match. Mean and max difference of `0.000000`
+while the patch was doing double the work and running slower than stock. The
+Cycles object count exposed it immediately. Check what produced the image before
+comparing images.
+
+**A parity test where both sides are trivially identical proves nothing.**
+Materials were silently broken for hours behind a passing test, because every
+test scene used the default material on both sides: grey == grey matches as
+convincingly as red == red. Every check now asserts twice — that the feature
+visibly changes the image at all, and that the patched path matches stock. The
+first assertion is what gives the second any meaning.
 
 ## Files touched
 
 | file | what |
 |---|---|
-| `intern/cycles/blender/object.cpp` | reader, reference flattening, flat storage, lifecycle |
+| `intern/cycles/blender/object.cpp` | reader, reference flattening, flat storage, lifecycle, per-instance flags |
 | `intern/cycles/blender/sync.h` | declarations, `RenderInstanceSet` |
 | `intern/cycles/blender/sync.cpp` | per-instancer dirty tracking in `sync_recalc` |
 | `source/blender/depsgraph/intern/depsgraph_query_iter.cc` | skip dupli expansion for tagged objects |
 
 `docs/TECHNICAL.md` has the implementation detail with file:line references.
-`docs/DEV-NOTES.md` is the working log, including the things I got wrong along
-the way and had to retract.
+`docs/DEV-NOTES.md` is the working log, including the things that turned out
+wrong along the way and had to be retracted.
 
 ## License
 
-Blender is GPL-2.0-or-later, so this patch is too.
+Blender is GPL-2.0-or-later, so this patch is too. See `LICENSE`.
