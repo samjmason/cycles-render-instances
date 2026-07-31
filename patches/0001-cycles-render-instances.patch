@@ -1,5 +1,5 @@
 diff --git a/intern/cycles/blender/object.cpp b/intern/cycles/blender/object.cpp
-index 319aa849515..ebb02c7c830 100644
+index 319aa849515..c1c50c307cf 100644
 --- a/intern/cycles/blender/object.cpp
 +++ b/intern/cycles/blender/object.cpp
 @@ -21,8 +21,14 @@
@@ -17,7 +17,7 @@ index 319aa849515..ebb02c7c830 100644
  #include "BKE_layer.hh"
  #include "BKE_material.hh"
  #include "BKE_object.hh"
-@@ -458,6 +464,459 @@ bool BlenderSync::sync_object_attributes(blender::Object &b_ob,
+@@ -458,6 +464,462 @@ bool BlenderSync::sync_object_attributes(blender::Object &b_ob,
    return changed;
  }
  
@@ -71,7 +71,10 @@ index 319aa849515..ebb02c7c830 100644
 +    const int depth)
 +{
 +  /* Same recursion bound Blender uses for duplis. */
-+  if (depth >= 8) {
++  /* Match Blender's dupli recursion limit exactly. object_dupli.cc stops when
++   * level == MAX_DUPLI_RECUR - 1 (== 7); our depth counter is offset one level
++   * deeper than its `level`, so truncating at 7 aligns the two. */
++  if (depth >= 7) {
 +    LOG_INFO << "render-instances: recursion limit reached, nested instances truncated";
 +    return;
 +  }
@@ -477,7 +480,7 @@ index 319aa849515..ebb02c7c830 100644
  /* Object Loop */
  
  void BlenderSync::sync_objects(blender::Depsgraph &b_depsgraph,
-@@ -475,6 +934,7 @@ void BlenderSync::sync_objects(blender::Depsgraph &b_depsgraph,
+@@ -475,6 +937,7 @@ void BlenderSync::sync_objects(blender::Depsgraph &b_depsgraph,
      /* prepare for sync */
      geometry_map.pre_sync();
      object_map.pre_sync();
@@ -485,7 +488,7 @@ index 319aa849515..ebb02c7c830 100644
      procedural_map.pre_sync();
      particle_system_map.pre_sync();
      motion_times.clear();
-@@ -522,6 +982,16 @@ void BlenderSync::sync_objects(blender::Depsgraph &b_depsgraph,
+@@ -522,6 +985,16 @@ void BlenderSync::sync_objects(blender::Depsgraph &b_depsgraph,
        continue;
      }
  
@@ -502,7 +505,7 @@ index 319aa849515..ebb02c7c830 100644
      /* Load per-object culling data. */
      culling.init_object(scene, *b_ob);
  
-@@ -566,6 +1036,9 @@ void BlenderSync::sync_objects(blender::Depsgraph &b_depsgraph,
+@@ -566,6 +1039,9 @@ void BlenderSync::sync_objects(blender::Depsgraph &b_depsgraph,
  
    geom_task_pool.wait_work();
  
@@ -512,7 +515,7 @@ index 319aa849515..ebb02c7c830 100644
    progress.set_sync_status("");
  
    if (!cancel && !motion) {
-@@ -575,6 +1048,7 @@ void BlenderSync::sync_objects(blender::Depsgraph &b_depsgraph,
+@@ -575,6 +1051,7 @@ void BlenderSync::sync_objects(blender::Depsgraph &b_depsgraph,
      /* Handle removed data and modified pointers, as this may free memory, delete Nodes in the
       * right order to ensure that dependent data is freed after their users. Objects should be
       * freed before particle systems and geometries. */
